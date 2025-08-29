@@ -12,13 +12,13 @@ import (
 
 // redisZSet 实现了 SortedSetTransactional，绑定一个固定 sorted set key。
 type redisZSet struct {
-	client  *redis.Client
+	client  redis.UniversalClient
 	key     string
 	factory SortedSetDataFactory
 }
 
 // NewRedisZSet 构造 SortedSetTransactional，传入 factory 用于反序列化时创建实例。
-func NewRedisZSet(client *redis.Client, key string, factory SortedSetDataFactory) SortedSetTransactional {
+func NewRedisZSet(client redis.UniversalClient, key string, factory SortedSetDataFactory) SortedSetTransactional {
 	return &redisZSet{
 		client:  client,
 		key:     key,

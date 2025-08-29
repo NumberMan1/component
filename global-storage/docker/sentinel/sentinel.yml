@@ -1,0 +1,78 @@
+version: '3.8'
+services:
+  master:
+    image: redis:latest
+    container_name: redis_master
+    command: redis-server --requirepass "123456"
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "123456", "ping"]
+      interval: 1s
+      timeout: 3s
+      retries: 30
+
+  slave1:
+    image: redis:latest
+    container_name: redis_slave1
+    command: redis-server --slaveof master 6379 --requirepass "123456" --masterauth "123456"
+    ports:
+      - "6380:6379"
+    depends_on:
+      master:
+        condition: service_healthy
+
+  slave2:
+    image: redis:latest
+    container_name: redis_slave2
+    command: redis-server --slaveof master 6379 --requirepass "123456" --masterauth "123456"
+    ports:
+      - "6381:6379"
+    depends_on:
+      master:
+        condition: service_healthy
+
+  sentinel1:
+    image: redis:latest
+    container_name: redis_sentinel1
+    command: >
+      bash -c "echo 'port 26379' > sentinel.conf && \
+               echo 'sentinel monitor mymaster master 6379 2' >> sentinel.conf && \
+               echo 'sentinel down-after-milliseconds mymaster 5000' >> sentinel.conf && \
+               echo 'sentinel failover-timeout mymaster 10000' >> sentinel.conf && \
+               echo 'sentinel parallel-syncs mymaster 1' >> sentinel.conf && \
+               echo 'sentinel auth-pass mymaster 123456' >> sentinel.conf && \
+               redis-server sentinel.conf --sentinel"
+    ports:
+      - "26379:26379"
+    depends_on: [master, slave1, slave2]
+
+  sentinel2:
+    image: redis:latest
+    container_name: redis_sentinel2
+    command: >
+      bash -c "echo 'port 26379' > sentinel.conf && \
+               echo 'sentinel monitor mymaster master 6379 2' >> sentinel.conf && \
+               echo 'sentinel down-after-milliseconds mymaster 5000' >> sentinel.conf && \
+               echo 'sentinel failover-timeout mymaster 10000' >> sentinel.conf && \
+               echo 'sentinel parallel-syncs mymaster 1' >> sentinel.conf && \
+               echo 'sentinel auth-pass mymaster 123456' >> sentinel.conf && \
+               redis-server sentinel.conf --sentinel"
+    ports:
+      - "26380:26379"
+    depends_on: [master, slave1, slave2]
+
+  sentinel3:
+    image: redis:latest
+    container_name: redis_sentinel3
+    command: >
+      bash -c "echo 'port 26379' > sentinel.conf && \
+               echo 'sentinel monitor mymaster master 6379 2' >> sentinel.conf && \
+               echo 'sentinel down-after-milliseconds mymaster 5000' >> sentinel.conf && \
+               echo 'sentinel failover-timeout mymaster 10000' >> sentinel.conf && \
+               echo 'sentinel parallel-syncs mymaster 1' >> sentinel.conf && \
+               echo 'sentinel auth-pass mymaster 123456' >> sentinel.conf && \
+               redis-server sentinel.conf --sentinel"
+    ports:
+      - "26381:26379"
+    depends_on: [master, slave1, slave2]

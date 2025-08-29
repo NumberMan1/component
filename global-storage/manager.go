@@ -24,9 +24,19 @@ func GlobalManager() *StorageManager {
 // RedisPass 可为空，RedisDB 默认为 0
 // 示例：{RedisAddr: "localhost:6379", RedisPass: "", RedisDB: 0}
 type ManagerConfig struct {
+	// 单体或主从模式 (提供 Master 地址)
 	RedisAddr string `json:"redis_addr" yaml:"redis-addr"`
+
+	// 哨兵模式 (提供哨兵地址列表和 Master 名称)
+	RedisMasterName    string   `json:"redis_master_name" yaml:"redis-master-name"`
+	RedisSentinelAddrs []string `json:"redis_sentinel_addrs" yaml:"redis-sentinel-addrs"`
+
+	// 集群模式 (提供集群节点地址列表)
+	RedisClusterAddrs []string `json:"redis_cluster_addrs" yaml:"redis-cluster-addrs"`
+
+	// 通用配置
 	RedisPass string `json:"redis_pass" yaml:"redis-pass"`
-	RedisDB   int    `json:"redis_db" yaml:"redis-db"`
+	RedisDB   int    `json:"redis_db" yaml:"redis-db"` // 注意: 在集群模式下通常无效
 }
 
 // StorageManager 管理 KV、Hash、SortedSet 存储实例，并持有统一的 Redis 客户端
@@ -36,7 +46,7 @@ type StorageManager struct {
 	mu sync.RWMutex
 
 	// 统一 Redis client
-	redisClient *redis.Client
+	redisClient redis.UniversalClient
 	redisCtx    context.Context
 
 	kvs      map[string]KVTransactional
@@ -47,11 +57,39 @@ type StorageManager struct {
 
 // NewManager 根据配置创建 StorageManager
 func NewManager(cfg ManagerConfig) (*StorageManager, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPass,
-		DB:       cfg.RedisDB,
-	})
+	var client redis.Cmdable // 使用接口类型以兼容不同客户端
+
+	switch {
+	case len(cfg.RedisClusterAddrs) > 0:
+		// 集群模式
+		clusterClient := redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:    cfg.RedisClusterAddrs,
+			Password: cfg.RedisPass,
+		})
+		client = clusterClient
+
+	case len(cfg.RedisSentinelAddrs) > 0 && cfg.RedisMasterName != "":
+		// 哨兵模式
+		failoverClient := redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    cfg.RedisMasterName,
+			SentinelAddrs: cfg.RedisSentinelAddrs,
+			Password:      cfg.RedisPass,
+			DB:            cfg.RedisDB,
+		})
+		client = failoverClient
+
+	case cfg.RedisAddr != "":
+		// 单体或主从模式
+		simpleClient := redis.NewClient(&redis.Options{
+			Addr:     cfg.RedisAddr,
+			Password: cfg.RedisPass,
+			DB:       cfg.RedisDB,
+		})
+		client = simpleClient
+
+	default:
+		return nil, errors.New("无效的 Redis 配置：必须提供 Addr, SentinelAddrs, 或 ClusterAddrs")
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -61,8 +99,37 @@ func NewManager(cfg ManagerConfig) (*StorageManager, error) {
 		return nil, err
 	}
 
+	var universalClient redis.UniversalClient
+
+	// (此部分为修改后的最终逻辑)
+	if len(cfg.RedisClusterAddrs) > 0 {
+		universalClient = redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:    cfg.RedisClusterAddrs,
+			Password: cfg.RedisPass,
+		})
+	} else if len(cfg.RedisSentinelAddrs) > 0 && cfg.RedisMasterName != "" {
+		universalClient = redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    cfg.RedisMasterName,
+			SentinelAddrs: cfg.RedisSentinelAddrs,
+			Password:      cfg.RedisPass,
+			DB:            cfg.RedisDB,
+		})
+	} else if cfg.RedisAddr != "" {
+		universalClient = redis.NewClient(&redis.Options{
+			Addr:     cfg.RedisAddr,
+			Password: cfg.RedisPass,
+			DB:       cfg.RedisDB,
+		})
+	} else {
+		return nil, errors.New("无效的 Redis 配置")
+	}
+
+	if err := universalClient.Ping(ctx).Err(); err != nil {
+		return nil, err
+	}
+
 	return &StorageManager{
-		redisClient: client,
+		redisClient: universalClient,
 		redisCtx:    context.Background(),
 		kvs:         make(map[string]KVTransactional),
 		hashs:       make(map[string]HashTransactional),

@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"reflect"
 	"sync"
 
 	"github.com/go-redis/redis/v8"
@@ -10,13 +11,13 @@ import (
 
 // redisHash 实现 HashTransactional
 type redisHash struct {
-	client      *redis.Client
+	client      redis.UniversalClient
 	key         string
 	dataFactory StorageDataFactory
 }
 
 // NewRedisHash 构造器
-func NewRedisHash(client *redis.Client, key string, dataFactory StorageDataFactory) HashTransactional {
+func NewRedisHash(client redis.UniversalClient, key string, dataFactory StorageDataFactory) HashTransactional {
 	return &redisHash{client: client, key: key, dataFactory: dataFactory}
 }
 
@@ -186,7 +187,27 @@ func (tx *inMemoryHashTx) Commit(ctx context.Context) error {
 	}
 
 	err := tx.base.client.Watch(ctx, func(txRedis *redis.Tx) error {
-		_, err := txRedis.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		// --- 检查阶段 ---
+		currentMap, err := txRedis.HGetAll(ctx, tx.base.key).Result()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return err
+		}
+
+		// 将快照转换为 map[string]string 以便比较
+		snapshotMapStr := make(map[string]string, len(tx.snapshot))
+		for k, v := range tx.snapshot {
+			snapshotMapStr[k] = string(v)
+		}
+
+		// 使用 reflect.DeepEqual 比较两个 map
+		if !reflect.DeepEqual(currentMap, snapshotMapStr) {
+			// Hash 的状态已被修改，中止事务
+			return redis.TxFailedErr
+		}
+		// --- 检查结束 ---
+
+		// --- 设置阶段 ---
+		_, err = txRedis.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			for _, op := range tx.opQueue {
 				if op.isSet {
 					pipe.HSet(ctx, tx.base.key, op.field, op.value)
