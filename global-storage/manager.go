@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"time"
 
@@ -20,23 +21,22 @@ func GlobalManager() *StorageManager {
 	return globalManager
 }
 
-// ManagerConfig 定义 StorageManager 的配置项，如 Redis 连接信息
-// RedisPass 可为空，RedisDB 默认为 0
-// 示例：{RedisAddr: "localhost:6379", RedisPass: "", RedisDB: 0}
+// ManagerConfig 定义了 StorageManager 的配置项
+// 支持 "standalone", "sentinel", "cluster" 三种模式
 type ManagerConfig struct {
-	RedisAddr string `json:"redis_addr" yaml:"redis-addr"`
-	RedisPass string `json:"redis_pass" yaml:"redis-pass"`
-	RedisDB   int    `json:"redis_db" yaml:"redis-db"`
+	Mode       string   `json:"mode" yaml:"mode"`               // "standalone", "sentinel", "cluster"
+	Addrs      []string `json:"addrs" yaml:"addrs"`             // Redis 地址列表。standalone/sentinel模式下第一个地址是主地址
+	MasterName string   `json:"master_name" yaml:"master-name"` // 哨兵模式下的 master name
+	RedisPass  string   `json:"redis_pass" yaml:"redis-pass"`
+	RedisDB    int      `json:"redis_db" yaml:"redis-db"` // 注意：集群模式不支持选择 DB
 }
 
-// StorageManager 管理 KV、Hash、SortedSet 存储实例，并持有统一的 Redis 客户端
-// 注册 Redis 存储时，会自动初始化并复用此客户端
-// 支持内存事务快照
+// StorageManager 管理存储实例，并持有统一的 Redis 客户端接口
 type StorageManager struct {
 	mu sync.RWMutex
 
-	// 统一 Redis client
-	redisClient *redis.Client
+	// redis.Cmdable 是一个通用接口，被 redis.Client, redis.FailoverClient, redis.ClusterClient 实现
+	redisClient redis.Cmdable
 	redisCtx    context.Context
 
 	kvs      map[string]KVTransactional
@@ -45,20 +45,55 @@ type StorageManager struct {
 	memHashs map[string]MemoryTransactional
 }
 
-// NewManager 根据配置创建 StorageManager
+// NewManager 根据配置创建 StorageManager，自动识别模式并创建对应客户端
 func NewManager(cfg ManagerConfig) (*StorageManager, error) {
-	client := redis.NewClient(&redis.Options{
-		Addr:     cfg.RedisAddr,
-		Password: cfg.RedisPass,
-		DB:       cfg.RedisDB,
-	})
-
+	var client redis.Cmdable
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	err := client.Ping(ctx).Err()
-	if err != nil {
-		return nil, err
+	switch strings.ToLower(cfg.Mode) {
+	case "sentinel":
+		if cfg.MasterName == "" || len(cfg.Addrs) == 0 {
+			return nil, errors.New("sentinel mode requires master_name and at least one address")
+		}
+		// 注意: NewFailoverClient 返回的是 *redis.Client 类型
+		failoverClient := redis.NewFailoverClient(&redis.FailoverOptions{
+			MasterName:    cfg.MasterName,
+			SentinelAddrs: cfg.Addrs,
+			Password:      cfg.RedisPass,
+			DB:            cfg.RedisDB,
+		})
+		if err := failoverClient.Ping(ctx).Err(); err != nil {
+			return nil, err
+		}
+		client = failoverClient
+	case "cluster":
+		if len(cfg.Addrs) == 0 {
+			return nil, errors.New("cluster mode requires at least one address")
+		}
+		clusterClient := redis.NewClusterClient(&redis.ClusterOptions{
+			Addrs:    cfg.Addrs,
+			Password: cfg.RedisPass,
+		})
+		if err := clusterClient.Ping(ctx).Err(); err != nil {
+			return nil, err
+		}
+		client = clusterClient
+	case "standalone", "": // 默认为单机模式
+		if len(cfg.Addrs) == 0 {
+			return nil, errors.New("standalone mode requires one address")
+		}
+		standaloneClient := redis.NewClient(&redis.Options{
+			Addr:     cfg.Addrs[0],
+			Password: cfg.RedisPass,
+			DB:       cfg.RedisDB,
+		})
+		if err := standaloneClient.Ping(ctx).Err(); err != nil {
+			return nil, err
+		}
+		client = standaloneClient
+	default:
+		return nil, errors.New("unsupported redis mode: " + cfg.Mode)
 	}
 
 	return &StorageManager{
@@ -73,13 +108,20 @@ func NewManager(cfg ManagerConfig) (*StorageManager, error) {
 
 // Close 关闭 StorageManager 持有的 Redis 客户端连接
 func (m *StorageManager) Close() error {
-	if m.redisClient != nil {
-		return m.redisClient.Close()
+	// **FIXED**: 移除了对 redis.FailoverClient 的错误断言。
+	// NewFailoverClient 返回 *redis.Client，所以它会被第一个 case 捕获。
+	if c, ok := m.redisClient.(*redis.Client); ok {
+		return c.Close()
+	}
+	if c, ok := m.redisClient.(*redis.ClusterClient); ok {
+		return c.Close()
+	}
+	// `redis.Ring` 也是一种可能性，尽管我们在这里没有创建它
+	if c, ok := m.redisClient.(*redis.Ring); ok {
+		return c.Close()
 	}
 	return nil
 }
-
-// —— Redis 注册方法 ——
 
 // RegisterKVStorage 直接通过 Manager 的 Redis 客户端注册 KV 存储
 func (m *StorageManager) RegisterKVStorage(name string) error {
@@ -124,8 +166,6 @@ func (m *StorageManager) RegisterMemoryHash(name string) error {
 	m.memHashs[name] = NewMemoryStore()
 	return nil
 }
-
-// —— 通用获取与事务方法 ——
 
 // GetKV 获取已注册的 KV 存储
 func (m *StorageManager) GetKV(name string) (KVTransactional, error) {

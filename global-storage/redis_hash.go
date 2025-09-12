@@ -3,20 +3,20 @@ package storage
 import (
 	"context"
 	"errors"
+	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/go-redis/redis/v8"
 )
 
-// redisHash 实现 HashTransactional
 type redisHash struct {
-	client      *redis.Client
+	client      redis.Cmdable
 	key         string
 	dataFactory StorageDataFactory
 }
 
-// NewRedisHash 构造器
-func NewRedisHash(client *redis.Client, key string, dataFactory StorageDataFactory) HashTransactional {
+func NewRedisHash(client redis.Cmdable, key string, dataFactory StorageDataFactory) HashTransactional {
 	return &redisHash{client: client, key: key, dataFactory: dataFactory}
 }
 
@@ -121,39 +121,53 @@ func (tx *inMemoryHashTx) HSet(field string, value StorageData) error {
 	return nil
 }
 
+// **FIXED**: 实现了 HGet 的事务版本
 func (tx *inMemoryHashTx) HGet(field string, dest StorageData) error {
-	// 合并 snapshot 与 opQueue
-	data, found := tx.snapshot[field]
-	for _, op := range tx.opQueue {
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+
+	// 从后往前遍历操作队列，找到对该 field 的最后一次操作
+	for i := len(tx.opQueue) - 1; i >= 0; i-- {
+		op := tx.opQueue[i]
 		if op.field == field {
 			if op.isSet {
-				data = op.value
-				found = true
-			} else {
-				found = false
+				// 这是一个写操作，使用它的值
+				return dest.UnmarshalBinary(op.value)
 			}
+			// 这是一个删除操作
+			return ErrFieldNotFound
 		}
 	}
-	if !found {
-		return errors.New("field not found")
+
+	// 如果操作队列中没有，则从快照中查找
+	if data, found := tx.snapshot[field]; found {
+		return dest.UnmarshalBinary(data)
 	}
-	return dest.UnmarshalBinary(data)
+
+	return ErrFieldNotFound
 }
 
+// **FIXED**: 实现了 HGetAll 的事务版本
 func (tx *inMemoryHashTx) HGetAll(newDataFn func() StorageData) (map[string]StorageData, error) {
-	// 合并 snapshot 与 opQueue，顺序应用
+	tx.mu.Lock()
+	defer tx.mu.Unlock()
+
+	// 先复制一份快照
 	merged := make(map[string][]byte, len(tx.snapshot))
 	for f, v := range tx.snapshot {
-		merged[f] = append([]byte(nil), v...)
+		merged[f] = v
 	}
+
+	// 按顺序应用所有操作
 	for _, op := range tx.opQueue {
 		if op.isSet {
-			merged[op.field] = append([]byte(nil), op.value...)
+			merged[op.field] = op.value
 		} else {
 			delete(merged, op.field)
 		}
 	}
-	// 构造输出
+
+	// 反序列化结果
 	res := make(map[string]StorageData, len(merged))
 	for f, v := range merged {
 		data := newDataFn()
@@ -180,33 +194,39 @@ func (tx *inMemoryHashTx) Commit(ctx context.Context) error {
 	if tx.done {
 		return errors.New("transaction already finished")
 	}
+	tx.done = true
 
 	if len(tx.opQueue) == 0 {
-		return nil // 如果没有操作，则无需提交
+		return nil
 	}
 
-	err := tx.base.client.Watch(ctx, func(txRedis *redis.Tx) error {
-		_, err := txRedis.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			for _, op := range tx.opQueue {
-				if op.isSet {
-					pipe.HSet(ctx, tx.base.key, op.field, op.value)
-				} else {
-					pipe.HDel(ctx, tx.base.key, op.field)
-				}
-			}
-			return nil
-		})
-		return err
-	}, tx.base.key)
+	var scriptBuilder strings.Builder
+	args := make([]interface{}, 0, len(tx.opQueue)*2)
+	argIndex := 1 // Lua ARGV is 1-based
 
-	if err != nil {
-		if errors.Is(err, redis.TxFailedErr) {
-			return ErrTransactionConflict
+	// 为每个操作生成独立的、带绝对索引的 redis.call
+	for _, op := range tx.opQueue {
+		if op.isSet {
+			// 生成: redis.call('hset', KEYS[1], ARGV[1], ARGV[2]);
+			scriptBuilder.WriteString("redis.call('hset', KEYS[1], ARGV[" + strconv.Itoa(argIndex) + "], ARGV[" + strconv.Itoa(argIndex+1) + "]); ")
+			args = append(args, op.field, op.value)
+			argIndex += 2
+		} else {
+			// 生成: redis.call('hdel', KEYS[1], ARGV[3]);
+			scriptBuilder.WriteString("redis.call('hdel', KEYS[1], ARGV[" + strconv.Itoa(argIndex) + "]); ")
+			args = append(args, op.field)
+			argIndex += 1
 		}
-		return err
 	}
 
-	tx.done = true
+	if len(args) == 0 {
+		return nil
+	}
+
+	err := tx.base.client.Eval(ctx, scriptBuilder.String(), []string{tx.base.key}, args...).Err()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
 	return nil
 }
 

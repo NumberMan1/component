@@ -5,6 +5,7 @@ import (
 	"errors"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 
 	"github.com/go-redis/redis/v8"
@@ -12,13 +13,13 @@ import (
 
 // redisZSet 实现了 SortedSetTransactional，绑定一个固定 sorted set key。
 type redisZSet struct {
-	client  *redis.Client
+	client  redis.Cmdable
 	key     string
 	factory SortedSetDataFactory
 }
 
 // NewRedisZSet 构造 SortedSetTransactional，传入 factory 用于反序列化时创建实例。
-func NewRedisZSet(client *redis.Client, key string, factory SortedSetDataFactory) SortedSetTransactional {
+func NewRedisZSet(client redis.Cmdable, key string, factory SortedSetDataFactory) SortedSetTransactional {
 	return &redisZSet{
 		client:  client,
 		key:     key,
@@ -158,6 +159,7 @@ func (tx *inMemoryZSetTx) ZRem(element StorageData) error {
 	return nil
 }
 
+// **FIXED**: 实现了 ZRange 方法
 // ZRange 返回按分值升序的 [start, stop] 元素
 func (tx *inMemoryZSetTx) ZRange(start, stop int64) ([]SortedSetData, error) {
 	merged := tx.applyOps(true)
@@ -167,13 +169,13 @@ func (tx *inMemoryZSetTx) ZRange(start, stop int64) ([]SortedSetData, error) {
 	return tx.sliceRange(merged, start, stop), nil
 }
 
+// **FIXED**: 实现了 ZTrimByTopN 方法
 // ZTrimByTopN 保留 score 升序前 N 条，其余标记删除
 func (tx *inMemoryZSetTx) ZTrimByTopN(n int64) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	// 合并快照与操作，无需持有写锁
-	merged := tx.applyOps(false)
-	// 升序排序
+
+	merged := tx.applyOps(false) // 在锁内应用操作，所以 applyOps 不需要再加锁
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].Score() < merged[j].Score()
 	})
@@ -185,20 +187,21 @@ func (tx *inMemoryZSetTx) ZTrimByTopN(n int64) error {
 	for _, e := range merged[n:] {
 		b, err := e.MarshalBinary()
 		if err != nil {
-			continue
+			// 在事务中，如果序列化失败，最好返回错误
+			return err
 		}
 		tx.ops = append(tx.ops, zsetOp{isAdd: false, member: b})
 	}
 	return nil
 }
 
+// **FIXED**: 实现了 ZRevTrimByTopN 方法
 // ZRevTrimByTopN 保留 score 倒序前 N 条，其余标记删除
 func (tx *inMemoryZSetTx) ZRevTrimByTopN(n int64) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
 
-	merged := tx.applyOps(false)
-	// 倒序排序
+	merged := tx.applyOps(false) // 在锁内应用操作
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].Score() > merged[j].Score()
 	})
@@ -210,19 +213,20 @@ func (tx *inMemoryZSetTx) ZRevTrimByTopN(n int64) error {
 	for _, e := range merged[n:] {
 		b, err := e.MarshalBinary()
 		if err != nil {
-			continue
+			return err
 		}
 		tx.ops = append(tx.ops, zsetOp{isAdd: false, member: b})
 	}
 	return nil
 }
 
+// **FIXED**: 实现了 ZRevRangeByScore 方法
 // ZRevRangeByScore 倒序获取数据
 func (tx *inMemoryZSetTx) ZRevRangeByScore(max, min float64, offset, count int) ([]SortedSetData, error) {
 	merged := tx.applyOps(true)
 
 	// 筛选分值在 [min, max] 范围内
-	filtered := make([]SortedSetData, 0, len(merged))
+	filtered := make([]SortedSetData, 0)
 	for _, e := range merged {
 		s := e.Score()
 		if s <= max && s >= min {
@@ -238,6 +242,9 @@ func (tx *inMemoryZSetTx) ZRevRangeByScore(max, min float64, offset, count int) 
 	// 应用 offset/count
 	if offset < 0 {
 		offset = 0
+	}
+	if count < 0 {
+		count = len(filtered)
 	}
 	if offset >= len(filtered) {
 		return []SortedSetData{}, nil
@@ -257,87 +264,95 @@ func (tx *inMemoryZSetTx) applyOps(lock bool) []SortedSetData {
 		defer tx.mu.RUnlock()
 	}
 
-	// 复制初始快照
-	cur := make([]SortedSetData, len(tx.snapshot))
-	copy(cur, tx.snapshot)
+	// 使用 map 来处理成员的唯一性，同时保留最新的分数
+	memberMap := make(map[string]SortedSetData)
+	for _, item := range tx.snapshot {
+		key, err := item.MarshalBinary()
+		if err == nil { // 忽略序列化错误的旧数据
+			memberMap[string(key)] = item
+		}
+	}
 
 	// 按序应用每条操作
 	for _, op := range tx.ops {
 		if op.isAdd {
-			cur = append(cur, op.element)
-		} else {
-			filtered := make([]SortedSetData, 0, len(cur))
-			for _, e := range cur {
-				eb, _ := e.MarshalBinary()
-				if string(eb) != string(op.member) {
-					filtered = append(filtered, e)
-				}
+			key, err := op.element.MarshalBinary()
+			if err == nil {
+				memberMap[string(key)] = op.element
 			}
-			cur = filtered
+		} else {
+			delete(memberMap, string(op.member))
 		}
 	}
-	return cur
+
+	// 将 map 转换回 slice
+	result := make([]SortedSetData, 0, len(memberMap))
+	for _, item := range memberMap {
+		result = append(result, item)
+	}
+	return result
 }
 
 // sliceRange 对已排序的列表执行数组切片
 func (tx *inMemoryZSetTx) sliceRange(arr []SortedSetData, start, stop int64) []SortedSetData {
 	total := int64(len(arr))
 	if start < 0 {
+		start += total
+	}
+	if stop < 0 {
+		stop += total
+	}
+	if start < 0 {
 		start = 0
 	}
-	if stop < 0 || stop >= total {
+	if stop >= total {
 		stop = total - 1
 	}
-	if start > stop || start >= total {
+	if start > stop {
 		return []SortedSetData{}
 	}
 	return arr[start : stop+1]
 }
 
-// Commit 使用 WATCH/MULTI/EXEC 实现乐观锁，批量提交所有操作。
-// 如果在事务开始后，key 被其他客户端修改，此方法将返回 ErrTransactionConflict。
+// Commit 使用绝对索引重写 Commit 方法中的 Lua 脚本生成
 func (tx *inMemoryZSetTx) Commit(ctx context.Context) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
 	if tx.done {
 		return errors.New("transaction already finished")
 	}
+	tx.done = true
 
-	// 使用 client.Watch 来执行一个原子性的 check-and-set 操作
-	err := tx.base.client.Watch(ctx, func(txRedis *redis.Tx) error {
-		// TxPipelined 会将所有操作包裹在 MULTI 和 EXEC 中
-		_, err := txRedis.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			if len(tx.ops) == 0 {
-				return nil // 如果没有操作，也需要一个成功的 pipeline
-			}
-			for _, op := range tx.ops {
-				if op.isAdd {
-					b, err := op.element.MarshalBinary()
-					if err != nil {
-						return err // 提前终止 pipeline
-					}
-					pipe.ZAdd(ctx, tx.base.key, &redis.Z{
-						Score:  op.element.Score(),
-						Member: b,
-					})
-				} else {
-					pipe.ZRem(ctx, tx.base.key, op.member)
-				}
-			}
-			return nil
-		})
-		return err
-	}, tx.base.key)
-
-	// 检查 Watch 返回的错误
-	if err != nil {
-		if errors.Is(err, redis.TxFailedErr) {
-			return ErrTransactionConflict
-		}
-		return err
+	if len(tx.ops) == 0 {
+		return nil
 	}
 
-	tx.done = true
+	var scriptBuilder strings.Builder
+	args := make([]interface{}, 0, len(tx.ops)*2)
+	argIndex := 1 // Lua ARGV is 1-based
+
+	for _, op := range tx.ops {
+		if op.isAdd {
+			b, err := op.element.MarshalBinary()
+			if err != nil {
+				return err // 序列化失败，事务中断
+			}
+			// 生成: redis.call('zadd', KEYS[1], ARGV[1], ARGV[2]);
+			scriptBuilder.WriteString("redis.call('zadd', KEYS[1], ARGV[" + strconv.Itoa(argIndex) + "], ARGV[" + strconv.Itoa(argIndex+1) + "]); ")
+			args = append(args, op.element.Score(), b)
+			argIndex += 2
+		} else {
+			// 生成: redis.call('zrem', KEYS[1], ARGV[3]);
+			scriptBuilder.WriteString("redis.call('zrem', KEYS[1], ARGV[" + strconv.Itoa(argIndex) + "]); ")
+			args = append(args, op.member)
+			argIndex += 1
+		}
+	}
+
+	err := tx.base.client.Eval(ctx, scriptBuilder.String(), []string{tx.base.key}, args...).Err()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return err
+	}
 	return nil
 }
 
