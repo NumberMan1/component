@@ -390,3 +390,33 @@ func TestTransaction_Hash_Conflict(t *testing.T) {
 	assert.Equal(t, 3, finalData.(*testData).ID)
 	assert.Equal(t, "From Tx2", finalData.(*testData).Name)
 }
+
+func TestTransaction_Hash_Conflict_With_Read(t *testing.T) {
+	client := setupRedisClient(t)
+	key := "test:hash:conflict_read"
+	hashStore := NewRedisHash(client, key, testDataFactory)
+	ctx := context.Background()
+
+	// 初始状态
+	hashStore.HSet(ctx, "user:1", &testData{ID: 1, Name: "Initial"})
+
+	tx1, _ := hashStore.BeginTx(ctx)
+	tx2, _ := hashStore.BeginTx(ctx)
+
+	// Tx1 修改并提交
+	tx1.HSet("user:1", &testData{ID: 2, Name: "Tx1"})
+	tx1.Commit(ctx)
+
+	// Tx2 读取了旧数据 (Initial)
+	// 因为调用了 HGet，该字段进入了 tx.seen，Commit 时会被 Watch 检查
+	var temp testData
+	tx2.HGet("user:1", &temp)
+
+	// Tx2 尝试基于旧数据修改
+	tx2.HSet("user:1", &testData{ID: 3, Name: "Tx2"})
+
+	// [预期] 这里必须报错，因为读取的数据过期了
+	err := tx2.Commit(ctx)
+	require.Error(t, err)
+	assert.Equal(t, ErrTransactionConflict, err)
+}
