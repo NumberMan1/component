@@ -1,0 +1,128 @@
+# AlertManager 配置文件
+global:
+  smtp_smarthost: 'localhost:587'
+  smtp_from: 'alertmanager@gameserver.com'
+  smtp_auth_username: 'alertmanager@gameserver.com'
+  smtp_auth_password: 'password'
+
+# 路由配置
+route:
+  group_by: ['alertname', 'cluster', 'service']
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  receiver: 'web.hook'
+  routes:
+    # 严重告警立即发送
+    - match:
+        severity: critical
+      receiver: 'critical-alerts'
+      group_wait: 0s
+      repeat_interval: 5m
+    
+    # 警告级别告警
+    - match:
+        severity: warning
+      receiver: 'warning-alerts'
+      group_wait: 30s
+      repeat_interval: 30m
+    
+    # 信息级别告警
+    - match:
+        severity: info
+      receiver: 'info-alerts'
+      group_wait: 5m
+      repeat_interval: 2h
+
+# 接收器配置
+receivers:
+  # 默认接收器
+  - name: 'web.hook'
+    webhook_configs:
+      - url: 'http://localhost:5001/webhook'
+        send_resolved: true
+
+  # 严重告警接收器
+  - name: 'critical-alerts'
+    # 邮件通知
+    email_configs:
+      - to: 'admin@gameserver.com'
+        subject: '🚨 [CRITICAL] {{ .GroupLabels.alertname }}'
+        body: |
+          {{ range .Alerts }}
+          告警名称: {{ .Annotations.summary }}
+          告警描述: {{ .Annotations.description }}
+          告警级别: {{ .Labels.severity }}
+          服务名称: {{ .Labels.service }}
+          开始时间: {{ .StartsAt.Format "2006-01-02 15:04:05" }}
+          {{ if .EndsAt }}结束时间: {{ .EndsAt.Format "2006-01-02 15:04:05" }}{{ end }}
+          
+          标签信息:
+          {{ range .Labels.SortedPairs }}- {{ .Name }}: {{ .Value }}
+          {{ end }}
+          {{ end }}
+        html: |
+          <h2>🚨 严重告警</h2>
+          {{ range .Alerts }}
+          <div style="border: 2px solid #ff4444; padding: 10px; margin: 10px 0; border-radius: 5px;">
+            <h3 style="color: #ff4444;">{{ .Annotations.summary }}</h3>
+            <p><strong>描述:</strong> {{ .Annotations.description }}</p>
+            <p><strong>级别:</strong> <span style="color: #ff4444;">{{ .Labels.severity }}</span></p>
+            <p><strong>服务:</strong> {{ .Labels.service }}</p>
+            <p><strong>开始时间:</strong> {{ .StartsAt.Format "2006-01-02 15:04:05" }}</p>
+            {{ if .EndsAt }}<p><strong>结束时间:</strong> {{ .EndsAt.Format "2006-01-02 15:04:05" }}</p>{{ end }}
+          </div>
+          {{ end }}
+    
+    # Webhook通知
+    webhook_configs:
+      - url: 'http://localhost:5001/critical'
+        send_resolved: true
+        http_config:
+          basic_auth:
+            username: 'alert'
+            password: 'webhook123'
+
+  # 警告级别接收器
+  - name: 'warning-alerts'
+    email_configs:
+      - to: 'ops@gameserver.com'
+        subject: '⚠️ [WARNING] {{ .GroupLabels.alertname }}'
+        body: |
+          {{ range .Alerts }}
+          告警名称: {{ .Annotations.summary }}
+          告警描述: {{ .Annotations.description }}
+          告警级别: {{ .Labels.severity }}
+          服务名称: {{ .Labels.service }}
+          开始时间: {{ .StartsAt.Format "2006-01-02 15:04:05" }}
+          {{ end }}
+    
+    webhook_configs:
+      - url: 'http://localhost:5001/warning'
+        send_resolved: true
+
+  # 信息级别接收器
+  - name: 'info-alerts'
+    webhook_configs:
+      - url: 'http://localhost:5001/info'
+        send_resolved: true
+
+# 抑制规则
+inhibit_rules:
+  # 如果有严重告警，抑制相同服务的警告告警
+  - source_match:
+      severity: 'critical'
+    target_match:
+      severity: 'warning'
+    equal: ['service', 'instance']
+  
+  # 如果服务下线，抑制该服务的其他告警
+  - source_match:
+      alertname: 'PrometheusTargetDown'
+    target_match_re:
+      service: '.*'
+    equal: ['instance']
+
+# 模板配置
+templates:
+  - '/etc/alertmanager/templates/*.tmpl'

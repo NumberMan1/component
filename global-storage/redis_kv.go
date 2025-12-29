@@ -46,6 +46,7 @@ func (r *redisKV) BeginTx(ctx context.Context) (KVTransaction, error) {
 	if err != nil && !errors.Is(err, redis.Nil) {
 		return nil, err
 	}
+	// b 为 nil 表示 key 不存在，snapshot 存为 nil
 	return &inMemoryKVTx{
 		base:     r,
 		snapshot: b,
@@ -99,9 +100,30 @@ func (tx *inMemoryKVTx) Commit(ctx context.Context) error {
 		return nil // 如果没有写操作，则无需提交
 	}
 
+	// [FIX] 使用 Watch 实现乐观锁，必须比较当前 Redis 中的值与 BeginTx 时的 snapshot 是否一致
 	err := tx.base.client.Watch(ctx, func(txRedis *redis.Tx) error {
-		// 在事务中，原子性地执行 SET
-		_, err := txRedis.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
+		// 1. 获取当前值 (CAS 检查)
+		currentVal, err := txRedis.Get(ctx, tx.base.key).Bytes()
+		if err != nil && !errors.Is(err, redis.Nil) {
+			return err
+		}
+
+		// 比较逻辑：
+		// 1. Snapshot 是 nil (BeginTx 时不存在)，Current 是有值 -> 冲突
+		// 2. Snapshot 是有值，Current 是 nil (期间被删) -> 冲突
+		// 3. 都有值，但内容不同 -> 冲突
+		snapshotIsNil := len(tx.snapshot) == 0
+		currentIsNil := errors.Is(err, redis.Nil)
+
+		if snapshotIsNil != currentIsNil {
+			return ErrTransactionConflict
+		}
+		if !snapshotIsNil && string(currentVal) != string(tx.snapshot) {
+			return ErrTransactionConflict
+		}
+
+		// 2. 值未变，执行事务写入
+		_, err = txRedis.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
 			pipe.Set(ctx, tx.base.key, tx.write, 0)
 			return nil
 		})
@@ -109,6 +131,7 @@ func (tx *inMemoryKVTx) Commit(ctx context.Context) error {
 	}, tx.base.key)
 
 	if err != nil {
+		// Watch 失败（监控期间变化）或者我们手动返回的冲突错误
 		if errors.Is(err, redis.TxFailedErr) {
 			return ErrTransactionConflict
 		}

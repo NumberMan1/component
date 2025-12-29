@@ -1,0 +1,170 @@
+groups:
+  - name: game-server-alerts
+    rules:
+      # HTTP 请求相关告警
+      - alert: HighErrorRate
+        expr: |
+          (
+            sum(rate(http_requests_total{status=~"5.."}[5m])) by (endpoint)
+            /
+            sum(rate(http_requests_total[5m])) by (endpoint)
+          ) > 0.05
+        for: 2m
+        labels:
+          severity: warning
+          service: game-server
+        annotations:
+          summary: "游戏服务器错误率过高"
+          description: "端点 {{ $labels.endpoint }} 的错误率为 {{ $value | humanizePercentage }}，超过5%阈值"
+
+      - alert: HighResponseTime
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(http_request_duration_seconds_bucket[5m])) by (le, endpoint)
+          ) > 1.0
+        for: 3m
+        labels:
+          severity: warning
+          service: game-server
+        annotations:
+          summary: "游戏服务器响应时间过长"
+          description: "端点 {{ $labels.endpoint }} 的95th响应时间为 {{ $value }}s，超过1秒阈值"
+
+      - alert: LowRequestRate
+        expr: |
+          sum(rate(http_requests_total[5m])) < 0.1
+        for: 5m
+        labels:
+          severity: info
+          service: game-server
+        annotations:
+          summary: "游戏服务器请求量过低"
+          description: "当前请求率为 {{ $value }} req/s，可能服务异常"
+
+      # 玩家相关告警
+      - alert: PlayerCountDrop
+        expr: |
+          (
+            players_online_count
+            < 
+            players_online_count offset 1h * 0.5
+          )
+        for: 10m
+        labels:
+          severity: warning
+          service: game-server
+        annotations:
+          summary: "在线玩家数大幅下降"
+          description: "当前在线玩家数 {{ $value }}，比1小时前下降超过50%"
+
+      - alert: NoPlayersOnline
+        expr: players_online_count == 0
+        for: 5m
+        labels:
+          severity: critical
+          service: game-server
+        annotations:
+          summary: "没有玩家在线"
+          description: "当前没有玩家在线，可能服务异常"
+
+      - alert: TooManyPlayersOnline
+        expr: players_online_count > 1000
+        for: 2m
+        labels:
+          severity: warning
+          service: game-server
+        annotations:
+          summary: "在线玩家数过多"
+          description: "当前在线玩家数 {{ $value }}，超过1000人，需要注意服务器负载"
+
+      # 系统资源告警
+      - alert: HighMemoryUsage
+        expr: |
+          sum(memory_usage_bytes) by (type) > 100 * 1024 * 1024  # 100MB
+        for: 5m
+        labels:
+          severity: warning
+          service: game-server
+        annotations:
+          summary: "内存使用量过高"
+          description: "{{ $labels.type }} 内存使用量为 {{ $value | humanizeBytes }}，超过100MB"
+
+      # 游戏操作告警
+      - alert: SlowGameOperations
+        expr: |
+          histogram_quantile(0.95, 
+            sum(rate(game_operation_duration_seconds_bucket[5m])) by (le, operation)
+          ) > 5.0
+        for: 3m
+        labels:
+          severity: warning
+          service: game-server
+        annotations:
+          summary: "游戏操作响应缓慢"
+          description: "操作 {{ $labels.operation }} 的95th响应时间为 {{ $value }}s，超过5秒阈值"
+
+      - alert: HighPlayerActionFailureRate
+        expr: |
+          (
+            sum(rate(player_actions_total{result="failed"}[5m])) by (action)
+            /
+            sum(rate(player_actions_total[5m])) by (action)
+          ) > 0.1
+        for: 3m
+        labels:
+          severity: warning
+          service: game-server
+        annotations:
+          summary: "玩家操作失败率过高"
+          description: "操作 {{ $labels.action }} 的失败率为 {{ $value | humanizePercentage }}，超过10%阈值"
+
+  - name: system-alerts
+    rules:
+      # 系统级告警
+      - alert: PrometheusTargetDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          summary: "Prometheus目标服务下线"
+          description: "目标 {{ $labels.instance }} (job: {{ $labels.job }}) 已下线超过1分钟"
+
+      - alert: PrometheusConfigReloadFailed
+        expr: prometheus_config_last_reload_successful != 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus配置重载失败"
+          description: "Prometheus配置重载失败，请检查配置文件"
+
+      - alert: HighCPUUsage
+        expr: |
+          100 - (avg by(instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100) > 80
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "CPU使用率过高"
+          description: "实例 {{ $labels.instance }} CPU使用率为 {{ $value }}%，超过80%阈值"
+
+      - alert: HighMemoryUsageSystem
+        expr: |
+          (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 85
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "系统内存使用率过高"
+          description: "实例 {{ $labels.instance }} 内存使用率为 {{ $value }}%，超过85%阈值"
+
+      - alert: DiskSpaceLow
+        expr: |
+          (1 - (node_filesystem_avail_bytes / node_filesystem_size_bytes)) * 100 > 90
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          summary: "磁盘空间不足"
+          description: "实例 {{ $labels.instance }} 磁盘 {{ $labels.mountpoint }} 使用率为 {{ $value }}%，超过90%阈值"

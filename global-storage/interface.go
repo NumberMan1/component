@@ -39,6 +39,7 @@ type SortedSetDataFactory func() SortedSetData
 type SortedSetData interface {
 	StorageData
 	Score() float64
+	SetScore(score float64)
 }
 
 // KVTransactional 绑定单一 key 的 KV 操作。
@@ -89,7 +90,6 @@ type SortedSetTransactional interface {
 }
 
 // SortedSetTransaction 定义有序集合事务快照操作。
-// 若你也需要在事务层面支持 RevRangeByScore，可在这里同样添加方法签名。
 type SortedSetTransaction interface {
 	ZAdd(element SortedSetData) error
 	ZRem(element StorageData) error

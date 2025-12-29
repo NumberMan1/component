@@ -53,6 +53,7 @@ func (r *redisZSet) ZRange(ctx context.Context, start, stop int64) ([]SortedSetD
 		if err := elem.UnmarshalBinary([]byte(z.Member.(string))); err != nil {
 			return nil, err
 		}
+		elem.SetScore(z.Score)
 		res = append(res, elem)
 	}
 	return res, nil
@@ -75,10 +76,7 @@ func (r *redisZSet) ZRangeByScore(ctx context.Context, min, max float64, offset,
 		if err := elem.UnmarshalBinary([]byte(z.Member.(string))); err != nil {
 			return nil, err
 		}
-		// 尝试设置分数（如果数据结构支持）
-		if setter, ok := elem.(interface{ SetScore(float64) }); ok {
-			setter.SetScore(z.Score)
-		}
+		elem.SetScore(z.Score)
 		out = append(out, elem)
 	}
 	return out, nil
@@ -101,9 +99,7 @@ func (r *redisZSet) ZRevRangeByScore(ctx context.Context, max, min float64, offs
 		if err := elem.UnmarshalBinary([]byte(z.Member.(string))); err != nil {
 			return nil, err
 		}
-		if setter, ok := elem.(interface{ SetScore(float64) }); ok {
-			setter.SetScore(z.Score)
-		}
+		elem.SetScore(z.Score)
 		out = append(out, elem)
 	}
 	return out, nil
@@ -121,6 +117,7 @@ func (r *redisZSet) BeginTx(ctx context.Context) (SortedSetTransaction, error) {
 		if err := elem.UnmarshalBinary([]byte(z.Member.(string))); err != nil {
 			return nil, err
 		}
+		elem.SetScore(z.Score)
 		snap = append(snap, elem)
 	}
 	return &inMemoryZSetTx{
@@ -184,7 +181,6 @@ func (tx *inMemoryZSetTx) ZRem(element StorageData) error {
 	return nil
 }
 
-// ZRange 返回按分值升序的 [start, stop] 元素
 func (tx *inMemoryZSetTx) ZRange(start, stop int64) ([]SortedSetData, error) {
 	merged := tx.applyOps()
 	sort.Slice(merged, func(i, j int) bool {
@@ -193,13 +189,10 @@ func (tx *inMemoryZSetTx) ZRange(start, stop int64) ([]SortedSetData, error) {
 	return tx.sliceRange(merged, start, stop), nil
 }
 
-// ZTrimByTopN 保留 score 升序前 N 条，其余标记删除
 func (tx *inMemoryZSetTx) ZTrimByTopN(n int64) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-	// 合并快照与操作，无需持有写锁
 	merged := tx.applyOpsWithoutLock()
-	// 升序排序
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].Score() < merged[j].Score()
 	})
@@ -207,7 +200,6 @@ func (tx *inMemoryZSetTx) ZTrimByTopN(n int64) error {
 	if total <= n {
 		return nil
 	}
-	// 添加删除操作
 	for _, e := range merged[n:] {
 		b, err := e.MarshalBinary()
 		if err != nil {
@@ -218,13 +210,10 @@ func (tx *inMemoryZSetTx) ZTrimByTopN(n int64) error {
 	return nil
 }
 
-// ZRevTrimByTopN 保留 score 倒序前 N 条，其余标记删除
 func (tx *inMemoryZSetTx) ZRevTrimByTopN(n int64) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
-
 	merged := tx.applyOpsWithoutLock()
-	// 倒序排序
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].Score() > merged[j].Score()
 	})
@@ -232,7 +221,6 @@ func (tx *inMemoryZSetTx) ZRevTrimByTopN(n int64) error {
 	if total <= n {
 		return nil
 	}
-	// 删除第 n 到 end
 	for _, e := range merged[n:] {
 		b, err := e.MarshalBinary()
 		if err != nil {
@@ -268,11 +256,8 @@ func (tx *inMemoryZSetTx) ZRangeByScore(min, max float64, offset, count int) ([]
 	return filtered[offset:end], nil
 }
 
-// ZRevRangeByScore 倒序获取数据
 func (tx *inMemoryZSetTx) ZRevRangeByScore(max, min float64, offset, count int) ([]SortedSetData, error) {
 	merged := tx.applyOps()
-
-	// 筛选分值在 [min, max] 范围内
 	filtered := make([]SortedSetData, 0, len(merged))
 	for _, e := range merged {
 		s := e.Score()
@@ -280,13 +265,9 @@ func (tx *inMemoryZSetTx) ZRevRangeByScore(max, min float64, offset, count int) 
 			filtered = append(filtered, e)
 		}
 	}
-
-	// 倒序排序
 	sort.Slice(filtered, func(i, j int) bool {
 		return filtered[i].Score() > filtered[j].Score()
 	})
-
-	// 应用 offset/count
 	if offset < 0 {
 		offset = 0
 	}
@@ -300,40 +281,15 @@ func (tx *inMemoryZSetTx) ZRevRangeByScore(max, min float64, offset, count int) 
 	return filtered[offset:end], nil
 }
 
-// applyOps 合并快照与操作日志（不排序）
 func (tx *inMemoryZSetTx) applyOps() []SortedSetData {
 	tx.mu.RLock()
 	defer tx.mu.RUnlock()
-
-	// 复制初始快照
-	cur := make([]SortedSetData, len(tx.snapshot))
-	copy(cur, tx.snapshot)
-
-	// 按序应用每条操作
-	for _, op := range tx.ops {
-		if op.isAdd {
-			cur = append(cur, op.element)
-		} else {
-			filtered := make([]SortedSetData, 0, len(cur))
-			for _, e := range cur {
-				eb, _ := e.MarshalBinary()
-				if string(eb) != string(op.member) {
-					filtered = append(filtered, e)
-				}
-			}
-			cur = filtered
-		}
-	}
-	return cur
+	return tx.applyOpsWithoutLock()
 }
 
-// applyOps 合并快照与操作日志（不排序）
 func (tx *inMemoryZSetTx) applyOpsWithoutLock() []SortedSetData {
-	// 复制初始快照
 	cur := make([]SortedSetData, len(tx.snapshot))
 	copy(cur, tx.snapshot)
-
-	// 按序应用每条操作
 	for _, op := range tx.ops {
 		if op.isAdd {
 			cur = append(cur, op.element)
@@ -351,7 +307,6 @@ func (tx *inMemoryZSetTx) applyOpsWithoutLock() []SortedSetData {
 	return cur
 }
 
-// sliceRange 对已排序的列表执行数组切片
 func (tx *inMemoryZSetTx) sliceRange(arr []SortedSetData, start, stop int64) []SortedSetData {
 	total := int64(len(arr))
 	if start < 0 {
@@ -366,7 +321,6 @@ func (tx *inMemoryZSetTx) sliceRange(arr []SortedSetData, start, stop int64) []S
 	return arr[start : stop+1]
 }
 
-// Commit 使用 TxPipeline 批量提交所有操作
 func (tx *inMemoryZSetTx) Commit(ctx context.Context) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
@@ -394,7 +348,6 @@ func (tx *inMemoryZSetTx) Commit(ctx context.Context) error {
 	return nil
 }
 
-// Rollback 丢弃所有未提交的操作
 func (tx *inMemoryZSetTx) Rollback() {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()

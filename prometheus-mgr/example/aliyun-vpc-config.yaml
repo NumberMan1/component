@@ -1,0 +1,149 @@
+# 阿里云VPC内部环境 Prometheus Manager 最简配置
+# 适用于阿里云ECS、容器服务等VPC内部环境
+
+# 基础配置
+service_name: "game-server"
+namespace: "game"
+subsystem: "server"
+environment: "production"
+
+# HTTP服务配置
+http:
+  enabled: true
+  host: "0.0.0.0"          # 监听所有网卡，适用于容器环境
+  port: 19090              # Prometheus指标端口
+  path: "/metrics"         # 指标路径
+  read_timeout: "30s"
+  write_timeout: "30s"
+  idle_timeout: "60s"
+
+# 指标配置
+metrics:
+  # 默认标签（会自动添加到所有指标）
+  default_labels:
+    region: "cn-hangzhou"    # 阿里云地域
+    zone: "cn-hangzhou-b"    # 可用区
+    cluster: "game-cluster"  # 集群名称
+    environment: "prod"      # 环境标识
+  
+  # 指标前缀
+  prefix: "game"
+  
+  # 包含Go运行时指标
+  include_go_metrics: true
+  
+  # 包含进程指标
+  include_process_metrics: true
+  
+  # 默认直方图桶配置（适用于游戏服务器）
+  default_histogram_buckets:
+    - 0.001   # 1ms
+    - 0.005   # 5ms
+    - 0.01    # 10ms
+    - 0.025   # 25ms
+    - 0.05    # 50ms
+    - 0.1     # 100ms
+    - 0.25    # 250ms
+    - 0.5     # 500ms
+    - 1.0     # 1s
+    - 2.5     # 2.5s
+    - 5.0     # 5s
+    - 10.0    # 10s
+  
+  # 默认摘要分位数配置
+  default_summary_objectives:
+    0.5: 0.05    # 50th percentile with 5% tolerance
+    0.9: 0.01    # 90th percentile with 1% tolerance
+    0.95: 0.005  # 95th percentile with 0.5% tolerance
+    0.99: 0.001  # 99th percentile with 0.1% tolerance
+
+# 收集器配置
+collectors:
+  # 启用内置收集器
+  builtin_enabled: true
+  
+  # 自定义收集器（可选）
+  custom_collectors: []
+
+# 高级配置
+advanced:
+  # 日志配置
+  log_level: "info"          # 日志级别: debug, info, warn, error
+  
+  # 性能配置
+  performance:
+    max_concurrent_requests: 100    # 最大并发请求数
+    request_timeout: "30s"          # 请求超时时间
+    
+  # 安全配置（VPC内部可以简化）
+  security:
+    # 基础认证（可选，VPC内部通常不需要）
+    basic_auth:
+      enabled: false
+      username: ""
+      password: ""
+    
+    # IP白名单（VPC内部可以放宽）
+    allowed_ips:
+      - "10.0.0.0/8"      # 阿里云VPC内网段
+      - "172.16.0.0/12"   # 阿里云VPC内网段
+      - "192.168.0.0/16"  # 阿里云VPC内网段
+    
+    # CORS配置
+    cors:
+      enabled: true
+      allowed_origins:
+        - "*"              # VPC内部可以允许所有来源
+      allowed_methods:
+        - "GET"
+        - "POST"
+        - "OPTIONS"
+      allowed_headers:
+        - "Content-Type"
+        - "Authorization"
+    
+    # TLS配置（VPC内部通常不需要）
+    tls:
+      enabled: false
+      cert_file: ""
+      key_file: ""
+  
+  # 健康检查配置
+  health_check:
+    enabled: true
+    path: "/health"
+    
+  # 中间件配置
+  middleware:
+    # 请求日志
+    request_logging: true
+    
+    # 恢复中间件
+    recovery: true
+    
+    # 限流中间件（可选）
+    rate_limiting:
+      enabled: false
+      requests_per_second: 1000
+      burst_size: 100
+
+# 阿里云特定配置
+aliyun:
+  # 地域信息
+  region: "cn-hangzhou"
+  zone: "cn-hangzhou-b"
+  
+  # VPC信息
+  vpc_id: "vpc-xxxxxxxxx"     # 替换为实际VPC ID
+  vswitch_id: "vsw-xxxxxxxx"  # 替换为实际交换机ID
+  
+  # 实例信息（可选）
+  instance_id: ""             # ECS实例ID，可通过元数据服务获取
+  instance_type: ""           # 实例规格
+  
+  # 标签（用于资源管理）
+  tags:
+    Project: "game-server"
+    Environment: "production"
+    Team: "backend"
+    Owner: "ops"
