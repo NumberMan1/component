@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 
 	"github.com/go-redis/redis/v8"
@@ -42,6 +43,40 @@ func (r *redisHash) HGet(ctx context.Context, field string) (StorageData, error)
 		return nil, err
 	}
 	return storageData, nil
+}
+
+func (r *redisHash) HMGet(ctx context.Context, fields ...string) ([]StorageData, error) {
+	if len(fields) == 0 {
+		return []StorageData{}, nil
+	}
+	vals, err := r.client.HMGet(ctx, r.key, fields...).Result()
+	if err != nil {
+		return nil, err
+	}
+	results := make([]StorageData, len(vals))
+	for i, v := range vals {
+		if v == nil {
+			results[i] = nil
+			continue
+		}
+
+		var b []byte
+		switch val := v.(type) {
+		case string:
+			b = []byte(val)
+		case []byte:
+			b = val
+		default:
+			return nil, fmt.Errorf("unexpected data type from redis HMGet: %T", v)
+		}
+
+		data := r.dataFactory()
+		if err := data.UnmarshalBinary(b); err != nil {
+			return nil, err
+		}
+		results[i] = data
+	}
+	return results, nil
 }
 
 func (r *redisHash) HGetAll(ctx context.Context) (map[string]StorageData, error) {
@@ -180,32 +215,17 @@ func (tx *inMemoryHashTx) Commit(ctx context.Context) error {
 	if tx.done {
 		return errors.New("transaction already finished")
 	}
-
-	if len(tx.opQueue) == 0 {
-		return nil // 如果没有操作，则无需提交
-	}
-
-	err := tx.base.client.Watch(ctx, func(txRedis *redis.Tx) error {
-		_, err := txRedis.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			for _, op := range tx.opQueue {
-				if op.isSet {
-					pipe.HSet(ctx, tx.base.key, op.field, op.value)
-				} else {
-					pipe.HDel(ctx, tx.base.key, op.field)
-				}
-			}
-			return nil
-		})
-		return err
-	}, tx.base.key)
-
-	if err != nil {
-		if errors.Is(err, redis.TxFailedErr) {
-			return ErrTransactionConflict
+	pipe := tx.base.client.TxPipeline()
+	for _, op := range tx.opQueue {
+		if op.isSet {
+			pipe.HSet(ctx, tx.base.key, op.field, op.value)
+		} else {
+			pipe.HDel(ctx, tx.base.key, op.field)
 		}
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
-
 	tx.done = true
 	return nil
 }

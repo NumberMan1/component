@@ -39,7 +39,6 @@ type SortedSetDataFactory func() SortedSetData
 type SortedSetData interface {
 	StorageData
 	Score() float64
-	SetScore(float64)
 }
 
 // KVTransactional 绑定单一 key 的 KV 操作。
@@ -62,6 +61,7 @@ type HashTransactional interface {
 	HGetAll(ctx context.Context) (map[string]StorageData, error)
 	HSet(ctx context.Context, field string, value StorageData) error
 	HGet(ctx context.Context, field string) (StorageData, error)
+	HMGet(ctx context.Context, fields ...string) ([]StorageData, error)
 	HDel(ctx context.Context, fields ...string) error
 	BeginTx(ctx context.Context) (HashTransaction, error)
 }
@@ -81,6 +81,7 @@ type SortedSetTransactional interface {
 	ZAdd(ctx context.Context, element SortedSetData) error
 	ZRem(ctx context.Context, element StorageData) error
 	ZRange(ctx context.Context, start, stop int64) ([]SortedSetData, error)
+	ZRangeByScore(ctx context.Context, min, max float64, offset, count int) ([]SortedSetData, error)
 	ZRevRangeByScore(ctx context.Context, max, min float64, offset, count int) ([]SortedSetData, error)
 	ZRevTrimByTopN(ctx context.Context, n int64) error
 	ZTrimByTopN(ctx context.Context, n int64) error
@@ -93,6 +94,7 @@ type SortedSetTransaction interface {
 	ZAdd(element SortedSetData) error
 	ZRem(element StorageData) error
 	ZRange(start, stop int64) ([]SortedSetData, error)
+	ZRangeByScore(min, max float64, offset, count int) ([]SortedSetData, error)
 	ZRevRangeByScore(max, min float64, offset, count int) ([]SortedSetData, error)
 	ZRevTrimByTopN(n int64) error
 	ZTrimByTopN(n int64) error

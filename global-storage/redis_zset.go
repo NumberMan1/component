@@ -53,10 +53,35 @@ func (r *redisZSet) ZRange(ctx context.Context, start, stop int64) ([]SortedSetD
 		if err := elem.UnmarshalBinary([]byte(z.Member.(string))); err != nil {
 			return nil, err
 		}
-		elem.SetScore(z.Score)
 		res = append(res, elem)
 	}
 	return res, nil
+}
+
+func (r *redisZSet) ZRangeByScore(ctx context.Context, min, max float64, offset, count int) ([]SortedSetData, error) {
+	opt := &redis.ZRangeBy{
+		Min:    strconv.FormatFloat(min, 'f', -1, 64),
+		Max:    strconv.FormatFloat(max, 'f', -1, 64),
+		Offset: int64(offset),
+		Count:  int64(count),
+	}
+	zs, err := r.client.ZRangeByScoreWithScores(ctx, r.key, opt).Result()
+	if err != nil && !errors.Is(err, redis.Nil) {
+		return nil, err
+	}
+	out := make([]SortedSetData, 0, len(zs))
+	for _, z := range zs {
+		elem := r.factory()
+		if err := elem.UnmarshalBinary([]byte(z.Member.(string))); err != nil {
+			return nil, err
+		}
+		// 尝试设置分数（如果数据结构支持）
+		if setter, ok := elem.(interface{ SetScore(float64) }); ok {
+			setter.SetScore(z.Score)
+		}
+		out = append(out, elem)
+	}
+	return out, nil
 }
 
 func (r *redisZSet) ZRevRangeByScore(ctx context.Context, max, min float64, offset, count int) ([]SortedSetData, error) {
@@ -76,7 +101,9 @@ func (r *redisZSet) ZRevRangeByScore(ctx context.Context, max, min float64, offs
 		if err := elem.UnmarshalBinary([]byte(z.Member.(string))); err != nil {
 			return nil, err
 		}
-		elem.SetScore(z.Score)
+		if setter, ok := elem.(interface{ SetScore(float64) }); ok {
+			setter.SetScore(z.Score)
+		}
 		out = append(out, elem)
 	}
 	return out, nil
@@ -94,7 +121,6 @@ func (r *redisZSet) BeginTx(ctx context.Context) (SortedSetTransaction, error) {
 		if err := elem.UnmarshalBinary([]byte(z.Member.(string))); err != nil {
 			return nil, err
 		}
-		elem.SetScore(z.Score)
 		snap = append(snap, elem)
 	}
 	return &inMemoryZSetTx{
@@ -160,7 +186,7 @@ func (tx *inMemoryZSetTx) ZRem(element StorageData) error {
 
 // ZRange 返回按分值升序的 [start, stop] 元素
 func (tx *inMemoryZSetTx) ZRange(start, stop int64) ([]SortedSetData, error) {
-	merged := tx.applyOps(true)
+	merged := tx.applyOps()
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].Score() < merged[j].Score()
 	})
@@ -172,7 +198,7 @@ func (tx *inMemoryZSetTx) ZTrimByTopN(n int64) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
 	// 合并快照与操作，无需持有写锁
-	merged := tx.applyOps(false)
+	merged := tx.applyOpsWithoutLock()
 	// 升序排序
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].Score() < merged[j].Score()
@@ -197,7 +223,7 @@ func (tx *inMemoryZSetTx) ZRevTrimByTopN(n int64) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
 
-	merged := tx.applyOps(false)
+	merged := tx.applyOpsWithoutLock()
 	// 倒序排序
 	sort.Slice(merged, func(i, j int) bool {
 		return merged[i].Score() > merged[j].Score()
@@ -217,9 +243,34 @@ func (tx *inMemoryZSetTx) ZRevTrimByTopN(n int64) error {
 	return nil
 }
 
+func (tx *inMemoryZSetTx) ZRangeByScore(min, max float64, offset, count int) ([]SortedSetData, error) {
+	merged := tx.applyOps()
+	filtered := make([]SortedSetData, 0, len(merged))
+	for _, e := range merged {
+		s := e.Score()
+		if s >= min && s <= max {
+			filtered = append(filtered, e)
+		}
+	}
+	sort.Slice(filtered, func(i, j int) bool {
+		return filtered[i].Score() < filtered[j].Score()
+	})
+	if offset < 0 {
+		offset = 0
+	}
+	if offset >= len(filtered) {
+		return []SortedSetData{}, nil
+	}
+	end := offset + count
+	if end > len(filtered) {
+		end = len(filtered)
+	}
+	return filtered[offset:end], nil
+}
+
 // ZRevRangeByScore 倒序获取数据
 func (tx *inMemoryZSetTx) ZRevRangeByScore(max, min float64, offset, count int) ([]SortedSetData, error) {
-	merged := tx.applyOps(true)
+	merged := tx.applyOps()
 
 	// 筛选分值在 [min, max] 范围内
 	filtered := make([]SortedSetData, 0, len(merged))
@@ -250,13 +301,34 @@ func (tx *inMemoryZSetTx) ZRevRangeByScore(max, min float64, offset, count int) 
 }
 
 // applyOps 合并快照与操作日志（不排序）
-// lock: 是否在执行期间加锁
-func (tx *inMemoryZSetTx) applyOps(lock bool) []SortedSetData {
-	if lock {
-		tx.mu.RLock()
-		defer tx.mu.RUnlock()
-	}
+func (tx *inMemoryZSetTx) applyOps() []SortedSetData {
+	tx.mu.RLock()
+	defer tx.mu.RUnlock()
 
+	// 复制初始快照
+	cur := make([]SortedSetData, len(tx.snapshot))
+	copy(cur, tx.snapshot)
+
+	// 按序应用每条操作
+	for _, op := range tx.ops {
+		if op.isAdd {
+			cur = append(cur, op.element)
+		} else {
+			filtered := make([]SortedSetData, 0, len(cur))
+			for _, e := range cur {
+				eb, _ := e.MarshalBinary()
+				if string(eb) != string(op.member) {
+					filtered = append(filtered, e)
+				}
+			}
+			cur = filtered
+		}
+	}
+	return cur
+}
+
+// applyOps 合并快照与操作日志（不排序）
+func (tx *inMemoryZSetTx) applyOpsWithoutLock() []SortedSetData {
 	// 复制初始快照
 	cur := make([]SortedSetData, len(tx.snapshot))
 	copy(cur, tx.snapshot)
@@ -294,8 +366,7 @@ func (tx *inMemoryZSetTx) sliceRange(arr []SortedSetData, start, stop int64) []S
 	return arr[start : stop+1]
 }
 
-// Commit 使用 WATCH/MULTI/EXEC 实现乐观锁，批量提交所有操作。
-// 如果在事务开始后，key 被其他客户端修改，此方法将返回 ErrTransactionConflict。
+// Commit 使用 TxPipeline 批量提交所有操作
 func (tx *inMemoryZSetTx) Commit(ctx context.Context) error {
 	tx.mu.Lock()
 	defer tx.mu.Unlock()
@@ -303,37 +374,19 @@ func (tx *inMemoryZSetTx) Commit(ctx context.Context) error {
 		return errors.New("transaction already finished")
 	}
 
-	// 使用 client.Watch 来执行一个原子性的 check-and-set 操作
-	err := tx.base.client.Watch(ctx, func(txRedis *redis.Tx) error {
-		// TxPipelined 会将所有操作包裹在 MULTI 和 EXEC 中
-		_, err := txRedis.TxPipelined(ctx, func(pipe redis.Pipeliner) error {
-			if len(tx.ops) == 0 {
-				return nil // 如果没有操作，也需要一个成功的 pipeline
-			}
-			for _, op := range tx.ops {
-				if op.isAdd {
-					b, err := op.element.MarshalBinary()
-					if err != nil {
-						return err // 提前终止 pipeline
-					}
-					pipe.ZAdd(ctx, tx.base.key, &redis.Z{
-						Score:  op.element.Score(),
-						Member: b,
-					})
-				} else {
-					pipe.ZRem(ctx, tx.base.key, op.member)
-				}
-			}
-			return nil
-		})
-		return err
-	}, tx.base.key)
-
-	// 检查 Watch 返回的错误
-	if err != nil {
-		if errors.Is(err, redis.TxFailedErr) {
-			return ErrTransactionConflict
+	pipe := tx.base.client.TxPipeline()
+	for _, op := range tx.ops {
+		if op.isAdd {
+			b, _ := op.element.MarshalBinary()
+			pipe.ZAdd(ctx, tx.base.key, &redis.Z{
+				Score:  op.element.Score(),
+				Member: b,
+			})
+		} else {
+			pipe.ZRem(ctx, tx.base.key, op.member)
 		}
+	}
+	if _, err := pipe.Exec(ctx); err != nil {
 		return err
 	}
 

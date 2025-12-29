@@ -18,7 +18,7 @@ type memStore struct {
 	locksMu sync.Mutex
 }
 
-func NewMem(cfg MemConfig) (Store, error) {
+func NewMemStore(cfg MemConfig) (Store, error) {
 	return &memStore{
 		data:  make(map[string]map[string]Entry),
 		locks: make(map[string]int64),
@@ -28,23 +28,12 @@ func NewMem(cfg MemConfig) (Store, error) {
 func (m *memStore) makeEntry(value any, ttl time.Duration) Entry {
 	var expireAt int64
 	if ttl > 0 {
-		expireAt = time.Now().Add(ttl).UnixNano()
+		expireAt = time.Now().Add(ttl).UnixMilli()
 	}
 	return Entry{
 		Val:       value,
 		ExpiresAt: expireAt,
 	}
-}
-
-// putInternal 内部无锁 Put
-func (m *memStore) putInternal(key, field string, item Item) {
-	entry := m.makeEntry(item.GetValue(), item.GetTTL())
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if _, ok := m.data[key]; !ok {
-		m.data[key] = make(map[string]Entry)
-	}
-	m.data[key][field] = entry
 }
 
 func (m *memStore) withLockWrapper(key string, lockTTL time.Duration, op func() error) error {
@@ -54,7 +43,7 @@ func (m *memStore) withLockWrapper(key string, lockTTL time.Duration, op func() 
 
 	m.locksMu.Lock()
 	lockKey := key
-	now := time.Now().UnixNano()
+	now := time.Now().UnixNano() // 锁还是可以用 Nano 精度，内部实现不影响接口
 
 	if exp, ok := m.locks[lockKey]; ok {
 		if now < exp {
@@ -76,72 +65,165 @@ func (m *memStore) withLockWrapper(key string, lockTTL time.Duration, op func() 
 }
 
 func (m *memStore) Put(ctx context.Context, key, field string, item Item, opts ...Option) error {
+	return m.PutBatch(ctx, key, map[string]Item{field: item}, opts...)
+}
+
+func (m *memStore) PutBatch(ctx context.Context, key string, items map[string]Item, opts ...Option) error {
 	o := &options{}
 	for _, opt := range opts {
 		opt(o)
 	}
 
 	return m.withLockWrapper(key, o.lockTTL, func() error {
-		m.putInternal(key, field, item)
+		m.mu.Lock()
+		defer m.mu.Unlock()
+
+		if _, ok := m.data[key]; !ok {
+			m.data[key] = make(map[string]Entry)
+		}
+
+		for field, item := range items {
+			entry := m.makeEntry(item.GetValue(), item.GetTTL())
+			m.data[key][field] = entry
+		}
 		return nil
 	})
 }
 
 func (m *memStore) Get(ctx context.Context, key, field string, opts ...Option) (Item, error) {
+	resMap, err := m.GetBatch(ctx, key, []string{field}, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if item, ok := resMap[field]; ok {
+		return item, nil
+	}
+	return nil, ErrMiss
+}
+
+func (m *memStore) GetBatch(ctx context.Context, key string, fields []string, opts ...Option) (map[string]Item, error) {
 	o := &options{}
 	for _, opt := range opts {
 		opt(o)
 	}
 
-	var result Item
+	result := make(map[string]Item)
+	var missingFields []string
+
 	err := m.withLockWrapper(key, o.lockTTL, func() error {
-		// 1. 尝试从内存读取
+		// 1. 内存读取
 		m.mu.RLock()
-		fields, ok := m.data[key]
-		var entry Entry
-		var exists bool
-		if ok {
-			entry, exists = fields[field]
-		}
+		group, ok := m.data[key]
 		m.mu.RUnlock()
 
-		// 2. 如果存在，检查是否过期
-		if exists {
-			if entry.ExpiresAt > 0 && time.Now().UnixNano() > entry.ExpiresAt {
-				// 已过期：执行惰性删除
-				m.mu.Lock()
-				// 双重检查：防止在 RUnlock 和 Lock 之间被其他协程更新了新值
-				if g, ok := m.data[key]; ok {
-					if cur, ok := g[field]; ok && cur.ExpiresAt == entry.ExpiresAt {
-						delete(g, field)
-						if len(g) == 0 {
-							delete(m.data, key)
+		for _, field := range fields {
+			var found bool
+			if ok {
+				if entry, exists := group[field]; exists {
+					// 检查过期 (毫秒)
+					if entry.ExpiresAt > 0 && time.Now().UnixMilli() > entry.ExpiresAt {
+						// 惰性删除 (原子升级锁)
+						m.mu.Lock()
+						if g, stillExists := m.data[key]; stillExists {
+							if cur, ok := g[field]; ok && cur.ExpiresAt == entry.ExpiresAt {
+								delete(g, field)
+								if len(g) == 0 {
+									delete(m.data, key)
+								}
+							}
 						}
+						m.mu.Unlock()
+						// 视为 Missing
+					} else {
+						result[field] = entry
+						found = true
 					}
 				}
-				m.mu.Unlock()
-				// 标记为不存在，以便进入后续的回源逻辑
-				exists = false
-			} else {
-				// 未过期：直接返回
-				result = entry
-				return nil
+			}
+			if !found {
+				missingFields = append(missingFields, field)
 			}
 		}
 
-		// 3. 缓存未命中（不存在或已过期），检查是否配置了 FetchFunc
-		if o.fetchFunc != nil {
-			fetchedItem, err := o.fetchFunc()
+		// 2. 回源处理
+		if len(missingFields) > 0 && o.fetchFunc != nil {
+			fetchedItems, err := o.fetchFunc(missingFields)
 			if err != nil {
 				return err
 			}
-			// 回填缓存 (putInternal 内部会加 m.mu.Lock)
-			m.putInternal(key, field, fetchedItem)
-			result = fetchedItem
-			return nil
+
+			if len(fetchedItems) > 0 {
+				// 回填内存 (无需再调 PutBatch，直接操作 map 即可，因为在锁内)
+				m.mu.Lock()
+				if _, ok := m.data[key]; !ok {
+					m.data[key] = make(map[string]Entry)
+				}
+				for f, item := range fetchedItems {
+					entry := m.makeEntry(item.GetValue(), item.GetTTL())
+					m.data[key][f] = entry
+					// 合并结果
+					result[f] = entry
+				}
+				m.mu.Unlock()
+			}
 		}
 
-		return ErrMiss
+		return nil
+	})
+
+	return result, err
+}
+
+// GetAll 获取 Key 下所有字段
+func (m *memStore) GetAll(ctx context.Context, key string, opts ...Option) (map[string]Item, error) {
+	o := &options{}
+	for _, opt := range opts {
+		opt(o)
+	}
+
+	result := make(map[string]Item)
+	var missingFields []string
+
+	err := m.withLockWrapper(key, o.lockTTL, func() error {
+		// 1. 内存读取
+		m.mu.RLock()
+		group, ok := m.data[key]
+		// 复制一份 field 列表或直接遍历，注意不要在 RLock 期间修改 map (如惰性删除)
+		// 这里我们先收集数据，过期的标记为 missing，不做复杂的原子惰性删除，依靠 fetch 覆盖或下次 remove
+		if ok {
+			for field, entry := range group {
+				if entry.ExpiresAt > 0 && time.Now().UnixMilli() > entry.ExpiresAt {
+					missingFields = append(missingFields, field)
+				} else {
+					result[field] = entry
+				}
+			}
+		}
+		m.mu.RUnlock()
+
+		// 2. 回源处理
+		if len(missingFields) > 0 && o.fetchFunc != nil {
+			fetchedItems, err := o.fetchFunc(missingFields)
+			if err != nil {
+				return err
+			}
+
+			if len(fetchedItems) > 0 {
+				m.mu.Lock()
+				// 二次检查 key 是否存在 (可能被其他协程删了)
+				if _, ok := m.data[key]; !ok {
+					m.data[key] = make(map[string]Entry)
+				}
+				for f, item := range fetchedItems {
+					entry := m.makeEntry(item.GetValue(), item.GetTTL())
+					m.data[key][f] = entry
+					result[f] = entry
+				}
+				m.mu.Unlock()
+			}
+		}
+
+		return nil
 	})
 
 	return result, err
@@ -190,7 +272,7 @@ func (m *memStore) Has(ctx context.Context, key, field string, opts ...Option) (
 			return nil
 		}
 
-		if entry.ExpiresAt > 0 && time.Now().UnixNano() > entry.ExpiresAt {
+		if entry.ExpiresAt > 0 && time.Now().UnixMilli() > entry.ExpiresAt {
 			m.mu.Lock()
 			if g, ok := m.data[key]; ok {
 				if cur, ok := g[field]; ok && cur.ExpiresAt == entry.ExpiresAt {

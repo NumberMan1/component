@@ -9,21 +9,26 @@ import (
 	"github.com/go-redis/redis/v8"
 )
 
+// RedisConfig Redis 特有的配置参数
+type RedisConfig struct {
+	RedisAddr string `json:"redis_addr" yaml:"redis-addr"`
+	RedisPass string `json:"redis_pass" yaml:"redis-pass"`
+	RedisDB   int    `json:"redis_db" yaml:"redis-db"`
+}
+
 type redisStore struct {
 	client *redis.Client
 }
 
-func New(cfg RedisConfig) (Store, error) {
-	if cfg.Addr == "" {
+func NewRedisStore(cfg RedisConfig) (Store, error) {
+	if cfg.RedisAddr == "" {
 		return nil, ErrConfig
 	}
 
 	rdb := redis.NewClient(&redis.Options{
-		Addr:         cfg.Addr,
-		Password:     cfg.Password,
-		DB:           cfg.DB,
-		PoolSize:     cfg.PoolSize,
-		MinIdleConns: cfg.MinIdleConns,
+		Addr:     cfg.RedisAddr,
+		Password: cfg.RedisPass,
+		DB:       cfg.RedisDB,
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
@@ -43,7 +48,8 @@ func New(cfg RedisConfig) (Store, error) {
 func (r *redisStore) pack(value any, ttl time.Duration) ([]byte, error) {
 	var expireAt int64
 	if ttl > 0 {
-		expireAt = time.Now().Add(ttl).UnixNano()
+		// 改为毫秒
+		expireAt = time.Now().Add(ttl).UnixMilli()
 	}
 
 	item := Entry{
@@ -59,19 +65,11 @@ func (r *redisStore) unpack(data []byte) (Item, error) {
 	if err := json.Unmarshal(data, &item); err != nil {
 		return nil, err
 	}
-	if item.ExpiresAt > 0 && time.Now().UnixNano() > item.ExpiresAt {
+	// 检查过期 (毫秒)
+	if item.ExpiresAt > 0 && time.Now().UnixMilli() > item.ExpiresAt {
 		return nil, ErrMiss
 	}
 	return item, nil
-}
-
-// putInternal 内部无锁 Put，用于 Get 内部回填
-func (r *redisStore) putInternal(ctx context.Context, key, field string, item Item) error {
-	bytes, err := r.pack(item.GetValue(), item.GetTTL())
-	if err != nil {
-		return err
-	}
-	return r.client.HSet(ctx, key, field, bytes).Err()
 }
 
 func (r *redisStore) withLockWrapper(ctx context.Context, key string, lockTTL time.Duration, op func() error) error {
@@ -90,14 +88,10 @@ func (r *redisStore) withLockWrapper(ctx context.Context, key string, lockTTL ti
 	}
 
 	defer func() {
-		script := `
-			if redis.call("get", KEYS[1]) == ARGV[1] then
-				return redis.call("del", KEYS[1])
-			else
-				return 0
-			end
-		`
-		r.client.Eval(ctx, script, []string{lockKey}, token)
+		val, err := r.client.Get(ctx, lockKey).Result()
+		if err == nil && val == token {
+			r.client.Del(ctx, lockKey)
+		}
 	}()
 
 	return op()
@@ -108,76 +102,186 @@ func (r *redisStore) withLockWrapper(ctx context.Context, key string, lockTTL ti
 // ---------------------------------------------------------
 
 func (r *redisStore) Put(ctx context.Context, key, field string, item Item, opts ...Option) error {
+	// Put 本质上是单字段的 PutBatch
+	return r.PutBatch(ctx, key, map[string]Item{field: item}, opts...)
+}
+
+func (r *redisStore) PutBatch(ctx context.Context, key string, items map[string]Item, opts ...Option) error {
 	o := &options{}
 	for _, opt := range opts {
 		opt(o)
 	}
 
 	return r.withLockWrapper(ctx, key, o.lockTTL, func() error {
-		return r.putInternal(ctx, key, field, item)
+		// 构建 HSet 参数: key, f1, v1, f2, v2...
+		values := make([]interface{}, 0, len(items)*2)
+		for field, item := range items {
+			bytes, err := r.pack(item.GetValue(), item.GetTTL())
+			if err != nil {
+				return err
+			}
+			values = append(values, field, bytes)
+		}
+		if len(values) == 0 {
+			return nil
+		}
+		return r.client.HSet(ctx, key, values...).Err()
 	})
 }
 
 func (r *redisStore) Get(ctx context.Context, key, field string, opts ...Option) (Item, error) {
+	// 复用 GetBatch 逻辑
+	resMap, err := r.GetBatch(ctx, key, []string{field}, opts...)
+	if err != nil {
+		return nil, err
+	}
+	if item, ok := resMap[field]; ok {
+		return item, nil
+	}
+	return nil, ErrMiss
+}
+
+func (r *redisStore) GetBatch(ctx context.Context, key string, fields []string, opts ...Option) (map[string]Item, error) {
 	o := &options{}
 	for _, opt := range opts {
 		opt(o)
 	}
 
-	var result Item
-	err := r.withLockWrapper(ctx, key, o.lockTTL, func() error {
-		// Lua 脚本负责读取、解析过期并删除
-		script := `
-			local val = redis.call("HGET", KEYS[1], ARGV[1])
-			if not val then return nil end
-			
-			local item = cjson.decode(val)
-			local exp = tonumber(item.e)
-			local now = tonumber(ARGV[2])
-			
-			if exp and exp > 0 and now > exp then
-				redis.call("HDEL", KEYS[1], ARGV[1])
-				return nil
-			end
-			
-			return val
-		`
-		nowNano := time.Now().UnixNano()
-		val, err := r.client.Eval(ctx, script, []string{key}, field, nowNano).Result()
+	result := make(map[string]Item)
+	var missingFields []string
 
-		// 1. 处理系统错误（网络问题等）
-		if err != nil && !errors.Is(err, redis.Nil) {
+	err := r.withLockWrapper(ctx, key, o.lockTTL, func() error {
+		// 1. 批量读取
+		if len(fields) == 0 {
+			return nil
+		}
+		vals, err := r.client.HMGet(ctx, key, fields...).Result()
+		if err != nil {
 			return err
 		}
 
-		// 2. 尝试处理命中逻辑
-		// 如果 err 为 nil 且 val 为 string，说明命中缓存且未过期
-		if err == nil {
-			if s, ok := val.(string); ok {
+		// 2. 解析与过期检查
+		for i, v := range vals {
+			field := fields[i]
+			if v == nil {
+				missingFields = append(missingFields, field)
+				continue
+			}
+
+			// HMGet 返回的是 string 或 nil (如果 v != nil)
+			if s, ok := v.(string); ok {
 				item, err := r.unpack([]byte(s))
-				if err != nil {
-					return err
+				if err == nil {
+					result[field] = item
+				} else {
+					// 解析失败或已过期 (unpack 返回 ErrMiss)
+					missingFields = append(missingFields, field)
 				}
-				result = item
-				return nil
+			} else {
+				missingFields = append(missingFields, field)
 			}
 		}
 
-		// 3. 处理未命中逻辑 (err 为 redis.Nil 或者 val 不是 string)
-		// 检查是否配置了 FetchFunc 进行回源
-		if o.fetchFunc != nil {
-			fetchedItem, err := o.fetchFunc()
+		// 3. 回源处理
+		if len(missingFields) > 0 && o.fetchFunc != nil {
+			fetchedItems, err := o.fetchFunc(missingFields)
 			if err != nil {
 				return err
 			}
-			if err := r.putInternal(ctx, key, field, fetchedItem); err != nil {
-				return err
+
+			// 如果有获取到数据，回填并合并
+			if len(fetchedItems) > 0 {
+				// 注意：这里调用 PutBatch，它是原子操作吗？
+				// 如果外层有锁 (lockTTL > 0)，则当前还持有锁，递归调用 PutBatch 需要小心。
+				// 此时 PutBatch 会再次尝试 SetNX。
+				// 问题：SetNX 不可重入！
+				// 解决：我们需要一个内部无锁的 putBatchInternal。
+
+				// 构建回填数据参数
+				values := make([]interface{}, 0, len(fetchedItems)*2)
+				for f, item := range fetchedItems {
+					bytes, err := r.pack(item.GetValue(), item.GetTTL())
+					if err != nil {
+						return err
+					}
+					values = append(values, f, bytes)
+
+					// 合并到结果集
+					result[f] = item
+				}
+
+				// 执行回填 (直接调用 redis client，绕过锁检查，因为我们已经在锁里了)
+				if len(values) > 0 {
+					if err := r.client.HSet(ctx, key, values...).Err(); err != nil {
+						return err
+					}
+				}
 			}
-			result = fetchedItem
-			return nil
 		}
 
-		return ErrMiss
+		return nil
+	})
+
+	return result, err
+}
+
+func (r *redisStore) GetAll(ctx context.Context, key string, opts ...Option) (map[string]Item, error) {
+	o := &options{}
+	for _, opt := range opts {
+		opt(o)
+	}
+
+	result := make(map[string]Item)
+	var missingFields []string
+
+	err := r.withLockWrapper(ctx, key, o.lockTTL, func() error {
+		// 1. 获取所有字段 (HGetAll)
+		vals, err := r.client.HGetAll(ctx, key).Result()
+		if err != nil {
+			return err
+		}
+
+		// 2. 解析与过期检查
+		for field, rawVal := range vals {
+			item, err := r.unpack([]byte(rawVal))
+			if err == nil {
+				// 有效
+				result[field] = item
+			} else {
+				// 解析失败或已过期 (unpack 返回 ErrMiss)
+				// 记录下来以便回源
+				missingFields = append(missingFields, field)
+			}
+		}
+
+		// 3. 回源处理 (针对已存在但过期的字段)
+		if len(missingFields) > 0 && o.fetchFunc != nil {
+			fetchedItems, err := o.fetchFunc(missingFields)
+			if err != nil {
+				return err
+			}
+
+			// 如果有获取到数据，回填并合并
+			if len(fetchedItems) > 0 {
+				values := make([]interface{}, 0, len(fetchedItems)*2)
+				for f, item := range fetchedItems {
+					bytes, err := r.pack(item.GetValue(), item.GetTTL())
+					if err != nil {
+						return err
+					}
+					values = append(values, f, bytes)
+					result[f] = item
+				}
+
+				if len(values) > 0 {
+					if err := r.client.HSet(ctx, key, values...).Err(); err != nil {
+						return err
+					}
+				}
+			}
+		}
+
+		return nil
 	})
 
 	return result, err
@@ -201,27 +305,16 @@ func (r *redisStore) Has(ctx context.Context, key, field string, opts ...Option)
 
 	var exists bool
 	err := r.withLockWrapper(ctx, key, o.lockTTL, func() error {
-		script := `
-			local val = redis.call("HGET", KEYS[1], ARGV[1])
-			if not val then return 0 end
-			
-			local item = cjson.decode(val)
-			local exp = tonumber(item.e)
-			local now = tonumber(ARGV[2])
-			
-			if exp and exp > 0 and now > exp then
-				redis.call("HDEL", KEYS[1], ARGV[1])
-				return 0
-			end
-			
-			return 1
-		`
-		nowNano := time.Now().UnixNano()
-		res, err := r.client.Eval(ctx, script, []string{key}, field, nowNano).Result()
+		val, err := r.client.HGet(ctx, key, field).Result()
 		if err != nil {
+			if errors.Is(err, redis.Nil) {
+				return nil
+			}
 			return err
 		}
-		exists = res.(int64) == 1
+		if _, err := r.unpack([]byte(val)); err == nil {
+			exists = true
+		}
 		return nil
 	})
 

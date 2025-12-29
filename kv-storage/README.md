@@ -11,12 +11,13 @@
 - **字段级过期 (Field TTL)**：
     - 支持为 Hash 结构中的单个字段设置独立的过期时间。
     - 通过 `Entry` 结构体或 `Item` 接口强制管理生命周期。
-- **原子惰性删除**：
-    - 读取时自动检查过期状态。如果发现过期，会原子性地删除脏数据（Redis 使用 Lua 脚本，Memory 使用双重检查锁），防止内存泄漏。
+- **惰性删除与回源**：
+    - **Redis 版**：采用高性能非原子模式。读取时检查过期，如果过期则视为未命中并触发回源覆盖，**不主动删除**过期数据（依赖回源覆盖或 Redis 自身淘汰），避免了 Lua 脚本开销。
+    - **Memory 版**：采用双重检查锁实现的原子惰性删除，读取过期数据时立即清理。
 - **并发控制**：
     - 提供 `WithLock` 选项，支持细粒度的锁保护。
 - **自动回源 (Cache Aside)**：
-    - 提供 `WithFetch` 选项，当缓存未命中时自动执行回调并回填缓存。
+    - 提供 `WithFetch` 选项，当缓存未命中（或已过期）时自动执行回调并回填缓存。
 
 ## 接口定义
 
@@ -27,12 +28,21 @@ type Store interface {
     // Put 设置字段值。
     // item: 必须实现 Item 接口(如 kvstorage.Entry)，指定值和 TTL。
     Put(ctx context.Context, key, field string, item Item, opts ...Option) error
+		PutBatch(ctx context.Context, key string, items map[string]Item, opts ...Option) error
 
     // Get 获取字段值。
     // 返回 Item 接口，通过 item.GetValue() 获取原始数据。
     // 若数据不存在或已过期，返回 ErrMiss。如果是 Redis 实现，反序列化需要注意类型断言。
+    // 如果配置了 WithFetch 且发生 Miss，会自动执行回调并回填。
     Get(ctx context.Context, key, field string, opts ...Option) (Item, error)
-
+    
+	// GetBatch 批量获取字段值
+    GetBatch(ctx context.Context, key string, fields []string, opts ...Option) (map[string]Item, error)
+    
+    // GetAll 获取该 Key 下的所有字段值。
+    // 自动过滤已过期字段。如果配置了 WithFetch，会对"已存在但过期"的字段触发回源并更新。
+    GetAll(ctx context.Context, key string, opts ...Option) (map[string]Item, error)
+  
     // Remove 删除字段。
     Remove(ctx context.Context, key string, fields []string, opts ...Option) error
 
@@ -52,12 +62,10 @@ type Store interface {
 import "your/project/infrastructure/component/kvstorage"
 
 // --- 初始化 Redis 版本 ---
-redisStore, err := kvstorage.New(kvstorage.RedisConfig{
+redisStore, err := kvstorage.NewRedisStore(kvstorage.RedisConfig{
     Addr:         "127.0.0.1:6379",
     Password:     "123456",
     DB:           0,
-    PoolSize:     100,
-    MinIdleConns: 10,
 })
 
 // --- 初始化 内存 版本 ---
@@ -92,7 +100,7 @@ fmt.Println(item.GetValue()) // "Alice"
 
 ### 3. 设置过期时间
 
-```go
+```
 // 该字段 5 分钟后逻辑过期
 store.Put(ctx, "session:1", "token", kvstorage.Entry{
     Val: "xyz-token",
@@ -105,16 +113,30 @@ store.Put(ctx, "session:1", "token", kvstorage.Entry{
 使用 `WithFetch` 可以在缓存未命中时自动调用函数获取数据并写入缓存，防止缓存击穿。
 
 ```go
-// 定义回源函数
-fetchUser := func() (kvstorage.Item, error) {
-    // 模拟从数据库查询
-    user := db.QueryUser(101)
-    // 返回带 TTL 的数据
-    return kvstorage.Entry{Val: user, TTL: 10 * time.Minute}, nil
+// 1. 定义回源函数 (例如从 Database 或 RPC 获取)
+fetchPlayers := func(missingIds []string) (map[string]kvstorage.Item, error) {
+    // 模拟 RPC 批量请求
+    rpcReq := &GetInfosReq{Ids: missingIds}
+    rpcRsp := client.GetInfos(rpcReq)
+    
+    res := make(map[string]kvstorage.Item)
+    for id, info := range rpcRsp.Infos {
+        res[id] = kvstorage.Entry{
+            Val: info, 
+            TTL: 10 * time.Minute, // 10分钟有效期
+        }
+    }
+    return res, nil
 }
 
-// 获取数据，如果未命中则自动调用 fetchUser 并回填
-item, err := store.Get(ctx, "cache:user", "101", kvstorage.WithFetch(fetchUser))
+// 2. 批量获取 (包含自动回源)
+ids := []string{"1001", "1002", "1003"}
+items, err := store.GetBatch(ctx, "player:info", ids, kvstorage.WithFetch(fetchPlayers))
+
+// 3. 使用结果
+for id, item := range items {
+    fmt.Printf("Player %s: %v\n", id, item.GetValue())
+}
 ```
 
 ### 5. 并发控制 (锁)
@@ -135,4 +157,4 @@ err := store.Put(ctx, "resource", "count",
 1. **数据类型差异**：
     - **Redis 版**：底层使用 JSON 序列化存储。`GetValue()` 返回的复杂对象（如结构体）如果是 `interface{}` 接收，可能会变成 `map[string]interface{}`。建议尽量存储基本类型或字节流，或者在业务层进行转换。
     - **Memory 版**：直接存储 Go 对象引用。
-2. **惰性删除**：过期数据只在访问（Get/Has）时才会被物理删除。对于 Redis 实现，建议配合定期的 Redis Key 清理策略（如 `LRU`）以防止冷数据堆积。
+2. **过期处理**：过期数据只在访问（Get/Has）时进行逻辑过滤。对于 Redis 实现，为了性能不再主动删除过期字段，建议配合定期的 Redis Key 清理策略（如 `LRU`）以防止冷数据堆积。
